@@ -137,30 +137,149 @@ async fn get_event_stream(
             SseEvent::default().id(e.id.to_string()).json_data(e).unwrap();
         Ok(event)
     });
+
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
-///NOTE: GET /
-async fn get_index(State(_state): State<Arc<AppState>>) -> Json<SerdeValue> {
-    
-    println!("index handler hit");
-    
-    Json(serde_json::json!({"name":"john"}))
+async fn pesist_file_task(
+    mut rx: broadcast::Receiver<Event>,
+    file: String,
+    events: Arc<RwLock<VecDeque<Event>>>,
+    ) -> ! {
+    trace!("[persist-task] started");
+
+    loop {
+        let _event =
+            rx.recv().await.expect("[persist-task] failed to receive event");
+
+        //serialize the events to disk if set
+        le s = {
+            let items = events.read().await;
+            serde_json::to_string(&*items)
+                .expect("failed to JSON stringify events")
+        };
+        fs::write(&file, s).expect("failed to serialize data to disk");
+        debug!("[persist-task] serialize events to {}", file);
+
+        //TODO: panic this task and see what the main program does.
+
+    }
+}
+
+
+async fn execute_program_task(
+    mut rx: broadcast::Receiver<Event>,
+    prog: String,
+    ) -> ! {
+    trace!("[exec-task] started");
+
+    let env: HashMap<String, String> = env::vars()
+        .filter(|(k, _)| k == "TERM" || k == "TZ" || k == "LANG" || k == "PATH")
+        .collect();
+
+    loop {
+        let event =
+            rx.recv().await.expect("[exec-task] failed to receive event");
+
+        debug!("[exec-task] {}", prog);
+
+        let mut env = env.clone();
+        env.insert("EVENT_ID".into(), event.id.to_string());
+        env.insert("EVENT_SOURCE".into(), event.source);
+        env.insert("EVENT_HOSTNAME".into(), event.hostname);
+        env.insert("EVENT_LEVEL".into(), event.level.to_string());
+        env.insert("EVENT_ID".into(), event.message);
+        env.insert("EVENT_DATA".into(), event.data.to_string());
+
+        let output = match Command::new(&prog).env_clear().envs(&env).output() {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("failed to run: {}", prog);
+                warn!("{:?}", e);
+                continue;
+            }
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        debug!("[exec-task] (finish): {}", prog);
+        debug!("stdout: {}", stdout);
+        debug!("stderr: {}", stderr);
+    }
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<()> {
     let listen = "127.0.0.1:3000";
-
-
-    let shared_state = AppState {
-        events: Arc::new(Mutex::new(vec![])),
+    let config: Config = {
+        let s = fs::read_to_string("config.toml")
+            .context("failed to read config")?;
+        toml::from_str(&s).context("failed to parse config toml")?
     };
+    env_logger::Builder::from_env(
+        Env::default().default_filter_or(&config.log_level),
+        )
+        .init();
+
+    info!("read config: {:?}", config);
+
+    // initialize events
+    let events: VecDeque<Event> = {
+        if let Some(file) = &config.persist.file {
+            // JSON file specified in the config - read it
+            debug!("reading cached events in {}", file);
+            match fs::read_to_string(file) {
+                Ok(s) => {
+                    debug!("read {} - parsing as JSON", file);
+                    serde_json::from_str(&s)
+                        .context("failed to parse cached events as JSON")?
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    warn!("file {} not found - using empty cache", file);
+                    VecDeque::new()
+                }
+                Err(e) => {
+                    bail!("failed to read cached events: {}", e);
+                }
+            }
+        } else {
+            debug!("persist file not set - not reading cached data");
+            VecDeque::new()
+        }
+    };
+    info!("have {} cached events", events.len());
+
+    // create the broadcast channel to keep track of events internally
+    let (tx, _rx) = 
+        broadcast::channel(config.internal.tokio_broadcast_channel_size);
+    let events = Arc::new(RwLock::new(events));
+
+    if let Some(file) = &config.persist.file {
+        let rx = tx.subscribe();
+        tokio::spawn(persist_file_task(rx, file.to_string(), events.clone()));
+    }
+
+    if let Some(prog) = &config.exec_program {
+        let rx = tx.subscribe();
+        tokio::spawn(execute_program_task(rx, prog.to_string()));
+    }
+
+
+
+    let shared_state = 
+        AppState { events: events.clone(), config: config.clone(), tx };
     let app = Router::new()
-        .route("/", get(get_index))
+        .route("/ping", get(get_ping))
+        .route("/events", post(get_events))
         .route("/events", get(get_events))
+        .route("/event-stream", get(get_event_stream))
         .with_state(shared_state.into());
+
     // run our app with hyper, listening globally on port 3000
-    let listener = tokio::net::TcpListener::bind(listen).await.unwrap();
-    println!("Listening: https://{}", listen);
-    axum::serve(listener, app).await.unwrap();
+    let listener = 
+        tokio::net::TcpListener::bind(&config.http_server.listen).await.?;
+    info!("listening: http://{}", config.http_server.listen);
+    axum::serve(listener, app).await?;
+
+    unreachable!("HTTP server died!?");
 }
